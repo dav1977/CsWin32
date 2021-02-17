@@ -221,6 +221,26 @@ public class GeneratorTests : IDisposable, IAsyncLifetime
         Assert.Equal("BSTR", ((IdentifierNameSyntax)bstrField.Declaration.Type).Identifier.ValueText);
     }
 
+    /// <summary>
+    /// Verifies that MSIHANDLE is not replaced with a SafeHandle, since it uses uint instead of IntPtr for its underlying type.
+    /// </summary>
+    [Fact]
+    public void MSIHANDLE_DoesNotBecomeSafeHandle()
+    {
+        this.generator = new Generator(this.metadataStream, compilation: this.compilation, parseOptions: this.parseOptions);
+        Assert.True(this.generator.TryGenerate("MsiGetLastErrorRecord", CancellationToken.None));
+        this.CollectGeneratedCode(this.generator);
+        this.AssertNoDiagnostics();
+
+        MethodDeclarationSyntax? method = this.FindGeneratedMethod("MsiGetLastErrorRecord");
+        Assert.NotNull(method);
+        Assert.Equal("MSIHANDLE", method!.ReturnType?.ToString());
+
+        MethodDeclarationSyntax? releaseMethod = this.FindGeneratedMethod("MsiCloseHandle");
+        Assert.NotNull(method);
+        Assert.Equal("MSIHANDLE", Assert.IsType<IdentifierNameSyntax>(releaseMethod!.ParameterList.Parameters[0].Type).Identifier.ValueText);
+    }
+
     [Theory]
     [InlineData("BOOL")]
     [InlineData("HRESULT")]

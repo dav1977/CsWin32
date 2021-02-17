@@ -88,6 +88,12 @@ namespace Microsoft.Windows.CsWin32
         private static readonly TypeSyntax VoidStar = SyntaxFactory.ParseTypeName("void*");
         private static readonly AttributeListSyntax DebuggerBrowsableNever = AttributeList().AddAttributes(DebuggerBrowsable(DebuggerBrowsableState.Never));
 
+        private static readonly HashSet<string> StringTypeDefNames = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "WSTR",
+            "STR",
+        };
+
         /// <summary>
         /// This is the preferred capitalizations for modules and class names.
         /// If they are not in this list, the capitalization will come from the metadata assembly.
@@ -239,7 +245,16 @@ namespace Microsoft.Windows.CsWin32
 
         private readonly List<ClassDeclarationSyntax> safeHandleTypes = new List<ClassDeclarationSyntax>();
 
-        private readonly Dictionary<string, string?> handleTypeReleaseMethod = new Dictionary<string, string?>();
+        /// <summary>
+        /// A dictionary where the key is the typedef struct name and the value is the method used to release it.
+        /// </summary>
+        private readonly Dictionary<string, string> handleTypeReleaseMethod = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// The set of names of typedef structs that represent handles where the handle has length of <see cref="IntPtr"/>
+        /// and is therefore appropriate to wrap in a <see cref="SafeHandle"/>.
+        /// </summary>
+        private readonly HashSet<string> handleTypeStructsWithIntPtrSizeFields = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
         /// The set of types that are or have been generated so we don't stack overflow for self-referencing types.
@@ -329,6 +344,15 @@ namespace Microsoft.Windows.CsWin32
                                 {
                                     this.handleTypeReleaseMethod.Add(name, freeMethodName);
                                     this.releaseMethods.Add(freeMethodName);
+
+                                    using FieldDefinitionHandleCollection.Enumerator fieldEnum = typeDefinition.GetFields().GetEnumerator();
+                                    fieldEnum.MoveNext();
+                                    FieldDefinitionHandle fieldHandle = fieldEnum.Current;
+                                    FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldHandle);
+                                    if (fieldDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypesOrNint, null) is IdentifierNameSyntax idName && idName.Identifier.ValueText == nameof(IntPtr))
+                                    {
+                                        this.handleTypeStructsWithIntPtrSizeFields.Add(name);
+                                    }
                                 }
 
                                 break;
@@ -832,8 +856,6 @@ namespace Microsoft.Windows.CsWin32
 
         internal TypeSyntax? GenerateSafeHandle(string releaseMethod)
         {
-            this.GenerateNullSafeHandleHelper();
-
             if (this.releaseMethodsWithSafeHandleTypesGenerating.TryGetValue(releaseMethod, out TypeSyntax? safeHandleType))
             {
                 return safeHandleType;
@@ -841,6 +863,7 @@ namespace Microsoft.Windows.CsWin32
 
             if (BclInteropSafeHandles.TryGetValue(releaseMethod, out TypeSyntax? bclType))
             {
+                this.GenerateNullSafeHandleHelper();
                 return bclType;
             }
 
@@ -857,9 +880,17 @@ namespace Microsoft.Windows.CsWin32
             safeHandleType = safeHandleType.WithAdditionalAnnotations(IsManagedTypeAnnotation, IsSafeHandleTypeAnnotation);
 
             var releaseMethodSignature = releaseMethodDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypesOrNint, null);
+            TypeSyntax releaseMethodParameterType = releaseMethodSignature.ParameterTypes[0];
 
             // If the release method takes more than one parameter, we can't generate a SafeHandle for it.
             if (releaseMethodSignature.RequiredParameterCount != 1)
+            {
+                safeHandleType = null;
+            }
+
+            // Do NOT generate a SafeHandle type for typedefs that don't use IntPtr as their field type.
+            // Otherwise when used, .NET will use a pointer-sized value where another size was appropriate.
+            if (!this.handleTypeStructsWithIntPtrSizeFields.Contains(releaseMethodParameterType.ToString()))
             {
                 safeHandleType = null;
             }
@@ -876,13 +907,12 @@ namespace Microsoft.Windows.CsWin32
                 return safeHandleType;
             }
 
+            this.GenerateNullSafeHandleHelper();
             this.GenerateExternMethod(releaseMethodHandle);
 
             TypeSyntax releaseMethodReturnType = this.GetReturnTypeCustomAttributes(releaseMethodDef) is { } atts
                  ? this.ReinterpretMethodSignatureType(releaseMethodSignature.ReturnType, atts, isReturnOrOutParam: true).Type
                  : releaseMethodSignature.ReturnType;
-
-            TypeSyntax releaseMethodParameterType = releaseMethodSignature.ParameterTypes[0];
 
             this.TryGetRenamedMethod(releaseMethod, out string? renamedReleaseMethod);
 
@@ -2082,7 +2112,9 @@ namespace Microsoft.Windows.CsWin32
                 .WithSemicolonToken(Token(SyntaxKind.SemicolonToken)));
 
             // public static explicit operator HWND(int value) => new HWND(value);
-            members = members.Add(ConversionOperatorDeclaration(Token(SyntaxKind.ExplicitKeyword), IdentifierName(name))
+            // Except make converting char* or byte* to typedefs representing strings implicit.
+            SyntaxToken explicitOrImplicitModifier = Token(StringTypeDefNames.Contains(name) ? SyntaxKind.ImplicitKeyword : SyntaxKind.ExplicitKeyword);
+            members = members.Add(ConversionOperatorDeclaration(explicitOrImplicitModifier, IdentifierName(name))
                 .AddParameterListParameters(Parameter(valueParameter.Identifier).WithType(fieldInfo.FieldType))
                 .WithExpressionBody(ArrowExpressionClause(ObjectCreationExpression(IdentifierName(name)).AddArgumentListArguments(Argument(valueParameter))))
                 .AddModifiers(Token(SyntaxKind.PublicKeyword), Token(SyntaxKind.StaticKeyword)) // operators MUST be public
@@ -2096,7 +2128,7 @@ namespace Microsoft.Windows.CsWin32
                 .WithExpressionBody(ArrowExpressionClause(
                     BinaryExpression(
                         SyntaxKind.EqualsExpression,
-                        MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, ThisExpression(), fieldIdentifierName),
+                        fieldAccessExpression,
                         MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, other, fieldIdentifierName))))
                 .WithSemicolonToken(Token(SyntaxKind.SemicolonToken)));
 
@@ -2112,16 +2144,17 @@ namespace Microsoft.Windows.CsWin32
                         InvocationExpression(MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, ThisExpression(), IdentifierName(nameof(Equals)))).AddArgumentListArguments(Argument(IdentifierName("other"))))))
                 .WithSemicolonToken(Token(SyntaxKind.SemicolonToken)));
 
-            // public override int GetHashCode() => this.Value.GetHashCode();
+            // public override int GetHashCode() => unchecked((int)this.Value); // if Value is a pointer
+            // public override int GetHashCode() => this.Value.GetHashCode(); // if Value is not a pointer
+            ExpressionSyntax hashExpr = fieldInfo.FieldType is PointerTypeSyntax ?
+                CheckedExpression(SyntaxKind.UncheckedExpression, CastExpression(PredefinedType(Token(SyntaxKind.IntKeyword)), fieldAccessExpression)) :
+                InvocationExpression(
+                    MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, fieldAccessExpression, IdentifierName(nameof(object.GetHashCode))),
+                    ArgumentList());
+
             members = members.Add(MethodDeclaration(PredefinedType(Token(SyntaxKind.IntKeyword)), nameof(object.GetHashCode))
                 .AddModifiers(Token(SyntaxKind.PublicKeyword), Token(SyntaxKind.OverrideKeyword))
-                .WithExpressionBody(ArrowExpressionClause(
-                    InvocationExpression(
-                        MemberAccessExpression(
-                            SyntaxKind.SimpleMemberAccessExpression,
-                            MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, ThisExpression(), fieldIdentifierName),
-                            IdentifierName(nameof(object.GetHashCode))),
-                        ArgumentList())))
+                .WithExpressionBody(ArrowExpressionClause(hashExpr))
                 .WithSemicolonToken(Token(SyntaxKind.SemicolonToken)));
 
             switch (name)
@@ -2136,10 +2169,17 @@ namespace Microsoft.Windows.CsWin32
                     break;
             }
 
+            var structModifiers = TokenList(Token(this.Visibility));
+            if (RequiresUnsafe(fieldInfo.FieldType))
+            {
+                structModifiers = structModifiers.Add(Token(SyntaxKind.UnsafeKeyword));
+            }
+
+            structModifiers = structModifiers.Add(Token(SyntaxKind.ReadOnlyKeyword)).Add(Token(SyntaxKind.PartialKeyword));
             StructDeclarationSyntax result = StructDeclaration(name)
                 .AddBaseListTypes(SimpleBaseType(GenericName(nameof(IEquatable<int>)).AddTypeArgumentListArguments(IdentifierName(name))))
                 .WithMembers(members)
-                .WithModifiers(TokenList(Token(this.Visibility), Token(SyntaxKind.ReadOnlyKeyword), Token(SyntaxKind.PartialKeyword)))
+                .WithModifiers(structModifiers)
                 .AddAttributeLists(AttributeList().AddAttributes(DebuggerDisplay("{" + fieldName + "}")));
 
             result = AddApiDocumentation(name, result);
@@ -2384,8 +2424,7 @@ namespace Microsoft.Windows.CsWin32
                     }
 
                     bool isArray = false;
-                    UnmanagedType? unmanagedType = null;
-                    bool isNullTerminated = false;
+                    bool isNullTerminated = false; // TODO
                     short? sizeParamIndex = null;
                     int? sizeConst = null;
                     foreach (CustomAttributeHandle attHandle in param.GetCustomAttributes())
@@ -2394,21 +2433,7 @@ namespace Microsoft.Windows.CsWin32
                         if (this.IsAttribute(att, InteropDecorationNamespace, NativeTypeInfoAttribute))
                         {
                             var args = att.DecodeValue(this.customAttributeTypeProvider);
-                            if (args.FixedArguments[0].Value is object value)
-                            {
-                                unmanagedType = (UnmanagedType)value;
-                                switch (unmanagedType.Value)
-                                {
-                                    case UnmanagedType.LPWStr:
-                                    case UnmanagedType.LPStr:
-                                    case UnmanagedType.LPTStr:
-                                    case UnmanagedType.LPArray:
-                                        isArray = true;
-                                        break;
-                                }
-                            }
-
-                            isNullTerminated |= args.NamedArguments.Any(a => a.Name == "IsNullTerminated" && a.Value is bool value && value);
+                            isArray = true;
                             sizeParamIndex = (short?)args.NamedArguments.FirstOrDefault(a => a.Name == "SizeParamIndex").Value;
                             sizeConst = (int?)args.NamedArguments.FirstOrDefault(a => a.Name == "SizeConst").Value;
 
@@ -2480,7 +2505,7 @@ namespace Microsoft.Windows.CsWin32
                                     LiteralExpression(SyntaxKind.NumericLiteralExpression, Literal(sizeConst.Value))),
                                 ThrowStatement(ObjectCreationExpression(IdentifierName(nameof(ArgumentException))).WithArgumentList(ArgumentList()))));
                         }
-                        else if (isNullTerminated && parameters[param.SequenceNumber - 1].Type is PointerTypeSyntax { ElementType: PredefinedTypeSyntax { Keyword: { RawKind: (int)SyntaxKind.CharKeyword } } })
+                        else if (isNullTerminated && isConst && parameters[param.SequenceNumber - 1].Type is PointerTypeSyntax { ElementType: PredefinedTypeSyntax { Keyword: { RawKind: (int)SyntaxKind.CharKeyword } } })
                         {
                             // replace char* with string
                             signatureChanged = true;
@@ -2725,43 +2750,6 @@ namespace Microsoft.Windows.CsWin32
             if (!isReturnOrOutParam && originalType.HasAnnotation(IsSafeHandleTypeAnnotation))
             {
                 return (SafeHandleTypeSyntax, null);
-            }
-
-            foreach (CustomAttributeHandle attHandle in customAttributes)
-            {
-                CustomAttribute att = this.mr.GetCustomAttribute(attHandle);
-                if (this.IsAttribute(att, InteropDecorationNamespace, NativeTypeInfoAttribute))
-                {
-                    var args = att.DecodeValue(this.customAttributeTypeProvider);
-                    if (args.FixedArguments[0].Value is object value)
-                    {
-                        UnmanagedType unmanagedType = (UnmanagedType)value;
-                        switch (unmanagedType)
-                        {
-                            case UnmanagedType.Bool: return (PredefinedType(Token(SyntaxKind.BoolKeyword)), MarshalAs(unmanagedType));
-                            case UnmanagedType.LPWStr:
-                                if (originalType is PointerTypeSyntax { ElementType: PredefinedTypeSyntax { Keyword: { RawKind: (int)SyntaxKind.UShortKeyword } } })
-                                {
-                                    return (PointerType(PredefinedType(Token(SyntaxKind.CharKeyword))), null);
-                                }
-
-                                break;
-
-                            case UnmanagedType.LPStr:
-                                if (originalType is PointerTypeSyntax { ElementType: PredefinedTypeSyntax { Keyword: { RawKind: (int)SyntaxKind.SByteKeyword } } })
-                                {
-                                    return (PointerType(PredefinedType(Token(SyntaxKind.ByteKeyword))), null);
-                                }
-
-                                break;
-
-                            default:
-                                break;
-                        }
-                    }
-
-                    break;
-                }
             }
 
             return (originalType, null);
